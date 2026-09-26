@@ -1,0 +1,67 @@
+#!/bin/bash
+
+ROOT=/mnt/pve/nvme_vmstore/dmz-logs/cache
+LOG="$ROOT/cache.csv"
+
+mkdir -p "$ROOT"
+
+if [ ! -s "$LOG" ]; then
+    echo "timestamp,id,mapper,cache_free,cache_total,cache_free_pct,cache_used_pct,random_free,random_total,sequential_free,sequential_total" > "$LOG"
+fi
+
+for M in $(dmsetup ls --target zoned 2>/dev/null |
+           awk '{print $1}' |
+           grep '^dmz_D' |
+           sort); do
+
+    STATUS=$(dmsetup status "$M" 2>/dev/null) || continue
+
+    ID=$(echo "$M" | sed -n 's/^dmz_\(D[0-9][0-9]\)_.*/\1/p')
+
+    CACHE=$(echo "$STATUS" | awk '{
+        for(i=1;i<=NF;i++)
+            if($i=="cache") print $(i-1)
+    }')
+
+    RANDOM=$(echo "$STATUS" | awk '{
+        for(i=1;i<=NF;i++)
+            if($i=="random") print $(i-1)
+    }')
+
+    SEQ=$(echo "$STATUS" | awk '{
+        for(i=1;i<=NF;i++)
+            if($i=="sequential") print $(i-1)
+    }')
+
+    CF=${CACHE%/*}
+    CT=${CACHE#*/}
+
+    RF=${RANDOM%/*}
+    RT=${RANDOM#*/}
+
+    SF=${SEQ%/*}
+    ST=${SEQ#*/}
+
+    [ "$CT" -gt 0 ] 2>/dev/null || continue
+
+    FREEP=$(awk -v f="$CF" -v t="$CT" \
+        'BEGIN {printf "%.2f",100*f/t}')
+
+    USEDP=$(awk -v f="$CF" -v t="$CT" \
+        'BEGIN {printf "%.2f",100*(t-f)/t}')
+
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(date '+%F %T')" \
+        "$ID" "$M" \
+        "$CF" "$CT" \
+        "$FREEP" "$USEDP" \
+        "$RF" "$RT" \
+        "$SF" "$ST" >> "$LOG"
+
+    LOW=$(awk -v p="$FREEP" 'BEGIN {print (p < 20)}')
+
+    if [ "$LOW" = "1" ]; then
+        logger -p daemon.warning -t dmz-cache \
+            "$ID cache free low: ${FREEP}% (${CF}/${CT})"
+    fi
+done

@@ -1,0 +1,299 @@
+#!/bin/bash
+set -u
+
+ROOT=/mnt/pve/nvme_vmstore
+CACHE="$ROOT/dmz-logs/cache"
+IO="$ROOT/dmz-logs/disk-io"
+SMART="$ROOT/dmz-logs/smart"
+PARAM=/sys/module/dm_zoned/parameters
+VMID=100
+EXPECTED_V3_SRC="1B63AEE4C1F0322EE73F79F"
+
+TMPMAX=$(mktemp)
+trap 'rm -f "$TMPMAX"' EXIT
+
+declare -A SERIAL META PHYS ACTIVE
+SERIAL[D01]=VFG3WPPD; META[D01]=4
+SERIAL[D02]=VFG2HGLC; META[D02]=5
+SERIAL[D03]=VEGVUTGZ; META[D03]=6
+SERIAL[D04]=VFG4D7BD; META[D04]=7
+SERIAL[D05]=VFG4ERMD; META[D05]=8
+SERIAL[D06]=VFG48PSD; META[D06]=9
+SERIAL[D07]=VFG3589D; META[D07]=10
+SERIAL[D08]=VFG2YAJC; META[D08]=11
+SERIAL[D09]=VFG4SNXD; META[D09]=12
+SERIAL[D10]=VFG50T9D; META[D10]=13
+SERIAL[D11]=VEGVPHMZ; META[D11]=16
+SERIAL[D12]=VEGVMATZ; META[D12]=17
+
+while read -r n s; do
+    [ -n "${s:-}" ] && PHYS["$s"]="/dev/$n"
+done < <(lsblk -dn -o NAME,SERIAL 2>/dev/null)
+
+param() {
+    local n="$1"
+    [ -r "$PARAM/$n" ] && cat "$PARAM/$n" || printf 'N/A'
+}
+
+svc_state() {
+    local x
+    x="$(systemctl is-active "$1" 2>/dev/null || true)"
+    printf '%s' "${x:-not-found}"
+}
+
+svc_enabled() {
+    local x
+    x="$(systemctl is-enabled "$1" 2>/dev/null || true)"
+    printf '%s' "${x:-not-found}"
+}
+
+live_pair() {
+    dmsetup status "$1" 2>/dev/null |
+    awk '{for(i=1;i<=NF;i++) if($i=="cache"){print $(i-1); exit}}'
+}
+
+classify() {
+    local f="$1" t="$2" e="$3" c="$4" p="$5"
+    if [ "$t" -le 0 ]; then printf 'UNKNOWN'; return; fi
+    if [ $((f*100)) -le $((e*t)) ]; then
+        printf 'EMERGENCY'
+    elif [ $((f*100)) -le $((c*t)) ]; then
+        printf 'CRITICAL'
+    elif [ $((f*100)) -le $((p*t)) ]; then
+        printf 'PRESSURE'
+    else
+        printf 'RECOVERY'
+    fi
+}
+
+# Historical max usage from existing cache monitor.
+{
+    for F in "$CACHE"/cache.csv "$CACHE"/cache.csv-*.gz; do
+        [ -f "$F" ] || continue
+        case "$F" in
+            *.gz) gzip -cd -- "$F" 2>/dev/null ;;
+            *) cat -- "$F" ;;
+        esac
+    done
+} | awk -F, '
+$2 ~ /^D[0-9][0-9]$/ {
+    u=$7+0
+    if (!($2 in max) || u>max[$2]) max[$2]=u
+}
+END {
+    for (i=1;i<=12;i++) {
+        id=sprintf("D%02d",i)
+        printf "%s,%.2f\n",id,max[id]+0
+    }
+}' > "$TMPMAX"
+
+# Collect active reclaim workers using historical dm-zoned metadata labels.
+while read -r line; do
+    n=$(printf '%s\n' "$line" | sed -n 's/.*dmz_rwq_dmz-dm-\([0-9][0-9]*\)_.*/\1/p')
+    id=""
+    case "$n" in
+        4) id=D01;; 5) id=D02;; 6) id=D03;; 7) id=D04;; 8) id=D05;; 9) id=D06;;
+        10) id=D07;; 11) id=D08;; 12) id=D09;; 13) id=D10;; 16) id=D11;; 17) id=D12;;
+    esac
+    [ -n "$id" ] && ACTIVE["$id"]="$line"
+done < <(
+    ps -eLo pid=,stat=,wchan:40=,args= 2>/dev/null |
+    awk '$2 ~ /^D/ && $3=="dmz_reclaim_copy" &&
+         /dmz_rwq_dmz-dm-[0-9]+_/ {print}'
+)
+
+printf '\n============================================================\n'
+printf ' DM-ZONED V3 / VM100 STATUS\n'
+printf ' %s\n' "$(date '+%F %T %Z %z')"
+printf '============================================================\n'
+
+VM=$(timeout 3 qm status "$VMID" 2>/dev/null | awk '{print $2}')
+PVE_STORAGE=$(pvesm status 2>/dev/null | awk '$1=="nvme-vmstore"{print $3}')
+DMZ=$(dmsetup ls --target zoned 2>/dev/null | awk '$1 ~ /^dmz_D/{n++} END{print n+0}')
+GEN=$(dmsetup ls --target zoned 2>/dev/null | awk '$1 ~ /^dmz-dm-/{n++} END{print n+0}')
+LIVE_SRC=$(cat /sys/module/dm_zoned/srcversion 2>/dev/null || printf 'not-loaded')
+
+printf '\n===== CORE =====\n'
+printf '%-24s %s\n' 'VM100' "${VM:-unknown}"
+printf '%-24s %s\n' 'nvme-vmstore' "${PVE_STORAGE:-unknown}"
+printf '%-24s %s\n' 'vm_store mount' "$(findmnt -n -o SOURCE /mnt/pve/nvme_vmstore 2>/dev/null || echo MISSING)"
+printf '%-24s %s\n' 'dm-zoned' "$DMZ/12"
+printf '%-24s %s\n' 'generic mapper' "$GEN"
+printf '%-24s %s\n' 'live srcversion' "$LIVE_SRC"
+printf '%-24s %s / %s\n' 'dmz-restore' "$(svc_state dmz-restore.service)" "$(svc_enabled dmz-restore.service)"
+printf '%-24s %s\n' 'io-monitor' "$(svc_state dmz-io-monitor.service)"
+printf '%-24s %s\n' 'kernel-watch' "$(svc_state dmz-kernel-watch.service)"
+
+if [ "$VM" = running ] && [ -r "/run/qemu-server/${VMID}.pid" ]; then
+    QPID=$(cat "/run/qemu-server/${VMID}.pid" 2>/dev/null || true)
+    if [ -n "${QPID:-}" ] && kill -0 "$QPID" 2>/dev/null; then
+        QLINE=$(ps -p "$QPID" -o pid=,stat=,%cpu=,%mem=,etime= 2>/dev/null || true)
+        printf '%-24s %s\n' 'QEMU pid/stat/cpu/mem' "$QLINE"
+        QD=$(ps -L -p "$QPID" -o stat= 2>/dev/null | awk '$1 ~ /^D/{n++} END{print n+0}')
+        printf '%-24s %s\n' 'QEMU D-state threads' "$QD"
+    fi
+fi
+
+printf '\n===== V3 SCHEDULER =====\n'
+for X in \
+    reclaim_active reclaim_max_active \
+    reclaim_start reclaim_stop \
+    reclaim_idle_sec reclaim_idle_throttle reclaim_poll_sec \
+    reclaim_slot_retry_ms reclaim_yield_ms \
+    reclaim_emergency_pct reclaim_critical_pct reclaim_pressure_pct \
+    reclaim_curve
+do
+    printf '%-28s = %s\n' "$X" "$(param "$X")"
+done
+
+RA=$(param reclaim_active); RM=$(param reclaim_max_active)
+case "$RA:$RM" in
+    *[!0-9:]*|'') SAFE='UNKNOWN' ;;
+    *)
+        EFF=$RM; [ "$EFF" -eq 0 ] && EFF=1
+        if [ "$RA" -le "$EFF" ]; then SAFE="OK ($RA <= $EFF)"; else SAFE="FAIL ($RA > $EFF)"; fi
+        ;;
+esac
+printf '%-28s = %s\n' 'active/max safety' "$SAFE"
+if [ "$LIVE_SRC" = "$EXPECTED_V3_SRC" ]; then
+    printf '%-28s = V3.0 expected\n' 'module identity'
+else
+    printf '%-28s = CHECK (%s)\n' 'module identity' "$LIVE_SRC"
+fi
+
+printf '\n===== NVME MD ARRAYS =====\n'
+for X in \
+    'cacheA:/dev/md/dmz_cache_A' \
+    'cacheB:/dev/md/dmz_cache_B' \
+    'vm_store:/dev/md/vm_store'
+do
+    NAME=${X%%:*}; DEV=${X#*:}
+    if [ -e "$DEV" ]; then
+        STATE=$(mdadm --detail "$DEV" 2>/dev/null | awk -F: '/State :/{gsub(/^ +| +$/,"",$2);print $2;exit}')
+        NACTIVE=$(mdadm --detail "$DEV" 2>/dev/null | awk -F: '/Active Devices/{gsub(/ /,"",$2);print $2;exit}')
+        printf '%-10s %-18s active=%s\n' "$NAME" "${STATE:-unknown}" "${NACTIVE:-?}"
+    else
+        printf '%-10s MISSING\n' "$NAME"
+    fi
+done
+
+EP=$(param reclaim_emergency_pct); CP=$(param reclaim_critical_pct); PP=$(param reclaim_pressure_pct)
+for V in EP CP PP; do
+    eval 'X=${'$V'}'
+    case "$X" in ''|*[!0-9]*) eval "$V=0";; esac
+done
+[ "$EP" -gt 0 ] || EP=5
+[ "$CP" -gt "$EP" ] || CP=20
+[ "$PP" -gt "$CP" ] || PP=50
+
+printf '\n===== LIVE CACHE / V3 PRIORITY =====\n'
+printf '%-4s %-10s %-8s %-11s %-8s %-8s %-10s %-8s\n' ID SERIAL PHYS FREE FREE% USED% CLASS ACTIVE
+TOTALFREE=0; TOTALTOTAL=0; MINF=-1; MINID=''; MAXF=-1; MAXID=''
+for i in $(seq -w 1 12); do
+    ID="D$i"; M="dmz_${ID}_${SERIAL[$ID]}"
+    PAIR=$(live_pair "$M")
+    if [[ "$PAIR" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+        F=${BASH_REMATCH[1]}; T=${BASH_REMATCH[2]}
+        TOTALFREE=$((TOTALFREE+F)); TOTALTOTAL=$((TOTALTOTAL+T))
+        [ "$MINF" -lt 0 ] || [ "$F" -ge "$MINF" ] || { MINF=$F; MINID=$ID; }
+        [ "$MINF" -ge 0 ] || { MINF=$F; MINID=$ID; }
+        [ "$F" -le "$MAXF" ] || { MAXF=$F; MAXID=$ID; }
+        FREEP=$(awk -v f="$F" -v t="$T" 'BEGIN{printf "%.1f%%",100*f/t}')
+        USED=$(awk -v f="$F" -v t="$T" 'BEGIN{printf "%.1f%%",100*(t-f)/t}')
+        CLS=$(classify "$F" "$T" "$EP" "$CP" "$PP")
+        A='-'; [ -n "${ACTIVE[$ID]:-}" ] && A='YES'
+        printf '%-4s %-10s %-8s %4s/%-6s %-8s %-8s %-10s %-8s\n' \
+            "$ID" "${SERIAL[$ID]}" "${PHYS[${SERIAL[$ID]}]:-?}" "$F" "$T" "$FREEP" "$USED" "$CLS" "$A"
+    else
+        printf '%-4s %-10s %-8s %-11s %-8s %-8s %-10s %-8s\n' \
+            "$ID" "${SERIAL[$ID]}" "${PHYS[${SERIAL[$ID]}]:-?}" 'ERROR' '-' '-' '-' '-'
+    fi
+done
+if [ "$TOTALTOTAL" -gt 0 ]; then
+    TPCT=$(awk -v f="$TOTALFREE" -v t="$TOTALTOTAL" 'BEGIN{printf "%.1f",100*f/t}')
+    printf '%-24s %s/%s (%s%% free)\n' 'TOTAL CACHE FREE' "$TOTALFREE" "$TOTALTOTAL" "$TPCT"
+fi
+printf '%-24s %s %s/1020\n' 'LOWEST' "$MINID" "$MINF"
+printf '%-24s %s %s/1020\n' 'HIGHEST' "$MAXID" "$MAXF"
+
+printf '\n===== ACTIVE RECLAIM (HISTORICAL LABEL MAP) =====\n'
+NACTIVE=0
+for i in $(seq -w 1 12); do
+    ID="D$i"
+    if [ -n "${ACTIVE[$ID]:-}" ]; then
+        NACTIVE=$((NACTIVE+1))
+        printf '%-4s %-10s meta=dmz-dm-%-2s  %s\n' "$ID" "${SERIAL[$ID]}" "${META[$ID]}" "${ACTIVE[$ID]}"
+    fi
+done
+[ "$NACTIVE" -gt 0 ] || echo 'none observed in this instant'
+
+RECLAIM_D=$(ps -eLo stat=,wchan:64= 2>/dev/null | awk '$1 ~ /^D/ && $2=="dmz_reclaim_copy" {n++} END{print n+0}')
+CHUNK_D=$(ps -eLo stat=,wchan:64= 2>/dev/null | awk '$1 ~ /^D/ && $2=="dmz_get_chunk_mapping" {n++} END{print n+0}')
+KCOPY_D=$(ps -eLo stat=,wchan:64=,args= 2>/dev/null | awk '$1 ~ /^D/ && index($0,"kcopyd") {n++} END{print n+0}')
+TOTAL_D=$(ps -eLo stat= 2>/dev/null | awk '$1 ~ /^D/{n++} END{print n+0}')
+printf '\n===== BLOCKED WORKERS =====\n'
+printf '%-24s %s\n' reclaimD "$RECLAIM_D"
+printf '%-24s %s\n' chunkD "$CHUNK_D"
+printf '%-24s %s\n' kcopyD "$KCOPY_D"
+printf '%-24s %s\n' total-D-state "$TOTAL_D"
+
+printf '\n===== CURRENT IO =====\n'
+printf '%-4s %9s %9s %8s   %9s %9s %8s\n' ID DMZ-R DMZ-W DMZ% DISK-R DISK-W DISK%
+if [ -f "$IO/io.csv" ]; then
+    tail -1500 "$IO/io.csv" | awk -F, '
+    $2=="dmz"  {dr[$3]=$5; dw[$3]=$6; du[$3]=$9}
+    $2=="hc620"{pr[$3]=$5; pw[$3]=$6; pu[$3]=$9}
+    END {
+        for(i=1;i<=12;i++){
+            id=sprintf("D%02d",i)
+            printf "%-4s %8.2fM %8.2fM %7.2f%%   %8.2fM %8.2fM %7.2f%%\n",id,dr[id]+0,dw[id]+0,du[id]+0,pr[id]+0,pw[id]+0,pu[id]+0
+        }
+    }'
+else
+    echo 'io.csv missing'
+fi
+
+printf '\n===== NVME / MD IO =====\n'
+printf '%-10s %9s %9s %10s %10s %8s\n' DEVICE READ WRITE R-IOPS W-IOPS UTIL
+if [ -f "$IO/io.csv" ]; then
+    tail -1500 "$IO/io.csv" | awk -F, '
+    $2=="nvme"{r["NVME"]=$5;w["NVME"]=$6;ri["NVME"]=$7;wi["NVME"]=$8;u["NVME"]=$9}
+    $2=="md"{r[$3]=$5;w[$3]=$6;ri[$3]=$7;wi[$3]=$8;u[$3]=$9}
+    END {
+        x[1]="NVME";x[2]="cacheA";x[3]="cacheB";x[4]="vmstore"
+        for(i=1;i<=4;i++){d=x[i];printf "%-10s %8.2fM %8.2fM %9.2f %9.2f %7.2f%%\n",d,r[d]+0,w[d]+0,ri[d]+0,wi[d]+0,u[d]+0}
+    }'
+else
+    echo 'io.csv missing'
+fi
+
+if [ -x /usr/local/sbin/dmz-trend ]; then
+    echo
+    /usr/local/sbin/dmz-trend
+fi
+
+printf '\n===== STORAGE / LOG =====\n'
+df -h /mnt/pve/nvme_vmstore 2>/dev/null | awk 'NR==2{printf "%-24s %s used / %s total (%s)\n","vm_store",$3,$2,$5}'
+LOGSIZE=$(du -sh "$ROOT/dmz-logs" 2>/dev/null | awk '{print $1}')
+printf '%-24s %s / 10GiB\n' 'monitor logs' "${LOGSIZE:-unknown}"
+
+printf '\n===== TIMERS =====\n'
+for U in dmz-cache-snapshot.timer dmz-health-snapshot.timer dmz-smart-snapshot.timer dmz-config-backup.timer dmz-log-cap.timer; do
+    printf '%-32s %s\n' "$U" "$(svc_state "$U")"
+done
+
+printf '\n===== SMART =====\n'
+if [ -f "$SMART/smart.log" ]; then
+    MTIME=$(stat -c '%y' "$SMART/smart.log" 2>/dev/null | cut -d. -f1)
+    printf '%-24s %s\n' 'last snapshot' "$MTIME"
+    BAD=$(tail -4000 "$SMART/smart.log" | grep -Ei 'SMART overall-health.*FAILED|FAILING_NOW|Critical Warning:[[:space:]]*0x[1-9A-Fa-f]' | tail -10)
+    if [ -n "$BAD" ]; then printf 'SMART WARNING:\n%s\n' "$BAD"; else echo 'No SMART failure detected in latest log window.'; fi
+else
+    echo 'smart.log missing'
+fi
+
+printf '\n===== HOST STORAGE / HANG SIGNALS THIS BOOT =====\n'
+ERR=$(journalctl -b -k --no-pager 2>/dev/null | grep -Ei 'hung task|blocked for more than|I/O error|buffer I/O error|blk_update_request|medium error|EXT4-fs error|device-mapper.*error|nvme.*(timeout|reset|error)|ata[0-9]+.*(reset|error|failed)' | tail -15)
+if [ -n "$ERR" ]; then printf '%s\n' "$ERR"; else echo 'No matching host storage/hang errors.'; fi
+
+printf '\n============================================================\n'

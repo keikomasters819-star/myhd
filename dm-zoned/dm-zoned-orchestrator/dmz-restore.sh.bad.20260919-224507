@@ -1,0 +1,87 @@
+#!/bin/bash
+set -u
+
+log() {
+    echo "[dmz-restore] $*"
+}
+
+fail() {
+    echo "[dmz-restore] ERROR: $*" >&2
+    exit 1
+}
+
+log "loading dm_zoned"
+modprobe dm_zoned || fail "cannot load dm_zoned"
+
+log "assembling md arrays"
+mdadm --assemble --scan --run >/dev/null 2>&1 || true
+
+for n in $(seq 1 60); do
+    [ -e /dev/md/dmz_cache_A ] &&
+    [ -e /dev/md/dmz_cache_B ] && break
+    sleep 1
+done
+
+[ -e /dev/md/dmz_cache_A ] || fail "dmz_cache_A missing"
+[ -e /dev/md/dmz_cache_B ] || fail "dmz_cache_B missing"
+
+log "activating LVM"
+vgchange -ay vg_dmz_A || fail "vg_dmz_A activation failed"
+vgchange -ay vg_dmz_B || fail "vg_dmz_B activation failed"
+
+udevadm settle
+
+start_one() {
+    FINAL="$1"
+    CACHE="$2"
+    SERIAL="$3"
+    DISK="/dev/disk/by-id/ata-HSH721414ALN6M0_${SERIAL}"
+
+    if dmsetup info "$FINAL" >/dev/null 2>&1; then
+        log "$FINAL already active"
+        return 0
+    fi
+
+    [ -e "$CACHE" ] || fail "$CACHE missing"
+    [ -e "$DISK" ]  || fail "$DISK missing"
+
+    DMNODE=$(basename "$(readlink -f "$CACHE")")
+    TMP="dmz-${DMNODE}"
+
+    if dmsetup info "$TMP" >/dev/null 2>&1; then
+        log "renaming existing $TMP -> $FINAL"
+        dmsetup rename "$TMP" "$FINAL" || fail "rename $FINAL failed"
+        return 0
+    fi
+
+    log "starting $FINAL"
+    dmzadm --start "$CACHE" "$DISK" || fail "dmzadm start $FINAL failed"
+
+    dmsetup info "$TMP" >/dev/null 2>&1 ||
+        fail "temporary mapper $TMP not created"
+
+    dmsetup rename "$TMP" "$FINAL" ||
+        fail "rename $TMP -> $FINAL failed"
+}
+
+start_one dmz_D01_VFG3WPPD /dev/vg_dmz_A/cache_a01 VFG3WPPD
+start_one dmz_D02_VFG2HGLC /dev/vg_dmz_A/cache_a02 VFG2HGLC
+start_one dmz_D03_VEGVUTGZ /dev/vg_dmz_A/cache_a03 VEGVUTGZ
+start_one dmz_D04_VFG4D7BD /dev/vg_dmz_A/cache_a04 VFG4D7BD
+start_one dmz_D05_VFG4ERMD /dev/vg_dmz_A/cache_a05 VFG4ERMD
+start_one dmz_D06_VFG48PSD /dev/vg_dmz_A/cache_a06 VFG48PSD
+
+start_one dmz_D07_VFG3589D /dev/vg_dmz_B/cache_b01 VFG3589D
+start_one dmz_D08_VFG2YAJC /dev/vg_dmz_B/cache_b02 VFG2YAJC
+start_one dmz_D09_VFG4SNXD /dev/vg_dmz_B/cache_b03 VFG4SNXD
+start_one dmz_D10_VFG50T9D /dev/vg_dmz_B/cache_b04 VFG50T9D
+start_one dmz_D11_VEGVPHMZ /dev/vg_dmz_B/cache_b05 VEGVPHMZ
+start_one dmz_D12_VEGVMATZ /dev/vg_dmz_B/cache_b06 VEGVMATZ
+
+COUNT=$(dmsetup ls --target zoned 2>/dev/null |
+        awk '$1 ~ /^dmz_D[0-9][0-9]_/ {n++} END {print n+0}')
+
+[ "$COUNT" -eq 12 ] || fail "expected 12 dm-zoned devices, found $COUNT"
+
+log "all 12 dm-zoned devices ready"
+exit 0

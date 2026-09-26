@@ -1,0 +1,69 @@
+#!/bin/bash
+
+ROOT=/mnt/pve/nvme_vmstore/dmz-logs
+HEALTH="$ROOT/health"
+LOG="$HEALTH/log-cap.log"
+CSV="$HEALTH/log-size.csv"
+
+CAP=$((10 * 1024 * 1024 * 1024))
+TARGET=$((9 * 1024 * 1024 * 1024))
+
+mkdir -p "$HEALTH"
+
+get_size() {
+    du -sb "$ROOT" 2>/dev/null | awk '{print $1}'
+}
+
+TOTAL=$(get_size)
+[ -n "$TOTAL" ] || exit 1
+
+GIB=$(awk -v b="$TOTAL" 'BEGIN {printf "%.3f",b/1073741824}')
+
+if [ ! -s "$CSV" ]; then
+    echo "timestamp,total_bytes,total_GiB,action" > "$CSV"
+fi
+
+if [ "$TOTAL" -le "$CAP" ]; then
+    echo "$(date '+%F %T'),$TOTAL,$GIB,keep" >> "$CSV"
+    exit 0
+fi
+
+echo "$(date '+%F %T') log usage ${GIB} GiB exceeds 10 GiB" >> "$LOG"
+
+logger -p daemon.warning -t dmz-log-cap \
+    "dmz logs exceed 10 GiB: ${GIB} GiB; deleting oldest archives"
+
+find "$ROOT" -type f -name '*.gz' -printf '%T@|%p\n' 2>/dev/null |
+sort -n |
+while IFS='|' read -r MTIME FILE; do
+
+    [ -f "$FILE" ] || continue
+
+    SIZE=$(stat -c %s "$FILE" 2>/dev/null || echo 0)
+
+    rm -f -- "$FILE"
+
+    echo "$(date '+%F %T') deleted $FILE size=$SIZE" >> "$LOG"
+
+    NOW=$(get_size)
+
+    if [ "$NOW" -le "$TARGET" ]; then
+        break
+    fi
+done
+
+TOTAL=$(get_size)
+GIB=$(awk -v b="$TOTAL" 'BEGIN {printf "%.3f",b/1073741824}')
+
+if [ "$TOTAL" -gt "$CAP" ]; then
+    ACTION="still_over_limit"
+
+    logger -p daemon.err -t dmz-log-cap \
+        "dmz logs still exceed limit after cleanup: ${GIB} GiB"
+
+    echo "$(date '+%F %T') WARNING still over limit: ${GIB} GiB" >> "$LOG"
+else
+    ACTION="cleaned_to_target"
+fi
+
+echo "$(date '+%F %T'),$TOTAL,$GIB,$ACTION" >> "$CSV"

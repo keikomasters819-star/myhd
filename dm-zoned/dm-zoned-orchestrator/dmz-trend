@@ -1,0 +1,79 @@
+#!/bin/bash
+
+ROOT=/mnt/pve/nvme_vmstore/dmz-logs
+CACHE="$ROOT/cache/cache.csv"
+IO="$ROOT/disk-io/io.csv"
+HEALTH="$ROOT/health/health.csv"
+
+NOW=$(date +%s)
+
+fresh()
+{
+    LABEL="$1"
+    FILE="$2"
+    LIMIT="$3"
+
+    if [ ! -f "$FILE" ]; then
+        printf "%-22s MISSING\n" "$LABEL"
+        return
+    fi
+
+    MTIME=$(stat -c %Y "$FILE")
+    AGE=$((NOW-MTIME))
+    TIME=$(date -d "@$MTIME" '+%F %T')
+
+    if [ "$AGE" -le "$LIMIT" ]; then
+        STATE=OK
+    else
+        STATE=STALE
+    fi
+
+    printf "%-22s %s  age=%ss  %s\n" \
+        "$LABEL" "$TIME" "$AGE" "$STATE"
+}
+
+echo
+echo "===== SAMPLE FRESHNESS ====="
+
+fresh "cache sample" "$CACHE" 150
+fresh "io sample" "$IO" 45
+fresh "health sample" "$HEALTH" 420
+
+echo
+echo "===== CACHE PEAK LAST 24H ====="
+
+CUTOFF=$(date -d '24 hours ago' '+%F %T')
+
+{
+    for F in \
+        "$ROOT"/cache/cache.csv \
+        "$ROOT"/cache/cache.csv-*.gz
+    do
+        [ -f "$F" ] || continue
+
+        case "$F" in
+            *.gz)
+                gzip -cd -- "$F" 2>/dev/null
+                ;;
+            *)
+                cat -- "$F"
+                ;;
+        esac
+    done
+} |
+awk -F, -v cutoff="$CUTOFF" '
+$2 ~ /^D[0-9][0-9]$/ && $1 >= cutoff {
+    u=$7+0
+
+    if (!($2 in max) || u>max[$2])
+        max[$2]=u
+}
+
+END {
+    printf "%-4s %10s\n","ID","MAX_24H"
+
+    for (i=1;i<=12;i++) {
+        id=sprintf("D%02d",i)
+        printf "%-4s %9.2f%%\n",id,max[id]+0
+    }
+}'

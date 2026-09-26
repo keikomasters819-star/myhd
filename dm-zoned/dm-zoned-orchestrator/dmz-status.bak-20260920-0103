@@ -1,0 +1,239 @@
+#!/bin/bash
+
+ROOT=/mnt/pve/nvme_vmstore
+CACHE="$ROOT/dmz-logs/cache"
+IO="$ROOT/dmz-logs/disk-io"
+SMART="$ROOT/dmz-logs/smart"
+
+TMPMAX=$(mktemp)
+trap 'rm -f "$TMPMAX"' EXIT
+
+echo
+echo "============================================================"
+echo " DM-ZONED / VM100 STATUS"
+echo " $(date '+%F %T')"
+echo "============================================================"
+
+VM=$(qm status 100 2>/dev/null | awk '{print $2}')
+PVE_STORAGE=$(pvesm status 2>/dev/null |
+    awk '$1=="nvme-vmstore"{print $3}')
+
+DMZ=$(dmsetup ls --target zoned 2>/dev/null |
+    awk '$1 ~ /^dmz_D/{n++} END{print n+0}')
+
+GEN=$(dmsetup ls --target zoned 2>/dev/null |
+    awk '$1 ~ /^dmz-dm-/{n++} END{print n+0}')
+
+echo
+echo "===== CORE ====="
+printf "%-22s %s\n" "VM100" "${VM:-unknown}"
+printf "%-22s %s\n" "nvme-vmstore" "${PVE_STORAGE:-unknown}"
+printf "%-22s %s\n" "vm_store mount" \
+    "$(findmnt -n -o SOURCE /mnt/pve/nvme_vmstore 2>/dev/null || echo MISSING)"
+printf "%-22s %s\n" "dm-zoned" "$DMZ/12"
+printf "%-22s %s\n" "generic mapper" "$GEN"
+printf "%-22s %s\n" "dmz-restore" \
+    "$(systemctl is-active dmz-restore.service 2>/dev/null)"
+printf "%-22s %s\n" "io-monitor" \
+    "$(systemctl is-active dmz-io-monitor.service 2>/dev/null)"
+printf "%-22s %s\n" "kernel-watch" \
+    "$(systemctl is-active dmz-kernel-watch.service 2>/dev/null)"
+
+echo
+echo "===== NVME MD ARRAYS ====="
+
+for X in \
+    "cacheA:/dev/md/dmz_cache_A" \
+    "cacheB:/dev/md/dmz_cache_B" \
+    "vm_store:/dev/md/vm_store"
+do
+    NAME=${X%%:*}
+    DEV=${X#*:}
+
+    if [ -e "$DEV" ]; then
+        STATE=$(mdadm --detail "$DEV" 2>/dev/null |
+            awk -F: '/State :/{gsub(/^ +| +$/,"",$2);print $2;exit}')
+
+        ACTIVE=$(mdadm --detail "$DEV" 2>/dev/null |
+            awk -F: '/Active Devices/{gsub(/ /,"",$2);print $2;exit}')
+
+        printf "%-10s %-15s active=%s\n" \
+            "$NAME" "${STATE:-unknown}" "${ACTIVE:-?}"
+    else
+        printf "%-10s MISSING\n" "$NAME"
+    fi
+done
+
+{
+    for F in \
+        "$CACHE"/cache.csv \
+        "$CACHE"/cache.csv-*.gz
+    do
+        [ -f "$F" ] || continue
+
+        case "$F" in
+            *.gz)
+                gzip -cd -- "$F" 2>/dev/null
+                ;;
+            *)
+                cat -- "$F"
+                ;;
+        esac
+    done
+} |
+awk -F, '
+$2 ~ /^D[0-9][0-9]$/ {
+    u=$7+0
+    if (!($2 in max) || u>max[$2])
+        max[$2]=u
+}
+END {
+    for (i=1;i<=12;i++) {
+        id=sprintf("D%02d",i)
+        printf "%s,%.2f\n",id,max[id]+0
+    }
+}' > "$TMPMAX"
+
+echo
+echo "===== CACHE ====="
+printf "%-4s %-12s %-12s %-14s\n" \
+    "ID" "USED_NOW" "MAX_USED" "FREE_ZONES"
+
+if [ -f "$CACHE/cache.csv" ]; then
+    awk -F, '
+    FNR==NR {
+        max[$1]=$2
+        next
+    }
+
+    $2 ~ /^D[0-9][0-9]$/ {
+        used[$2]=$7
+        free[$2]=$4 "/" $5
+    }
+
+    END {
+        for (i=1;i<=12;i++) {
+            id=sprintf("D%02d",i)
+
+            printf "%-4s %9.2f%% %9.2f%%   %-14s\n",
+                id,
+                used[id]+0,
+                max[id]+0,
+                free[id]
+        }
+    }' "$TMPMAX" "$CACHE/cache.csv"
+else
+    echo "cache.csv missing"
+fi
+
+echo
+echo "===== CURRENT IO ====="
+printf "%-4s %9s %9s %8s   %9s %9s %8s\n" \
+    "ID" \
+    "DMZ-R" "DMZ-W" "DMZ%" \
+    "DISK-R" "DISK-W" "DISK%"
+
+if [ -f "$IO/io.csv" ]; then
+    tail -1500 "$IO/io.csv" |
+    awk -F, '
+    $2=="dmz" {
+        dr[$3]=$5
+        dw[$3]=$6
+        du[$3]=$9
+    }
+
+    $2=="hc620" {
+        pr[$3]=$5
+        pw[$3]=$6
+        pu[$3]=$9
+    }
+
+    END {
+        for (i=1;i<=12;i++) {
+            id=sprintf("D%02d",i)
+
+            printf "%-4s %8.2fM %8.2fM %7.2f%%   %8.2fM %8.2fM %7.2f%%\n",
+                id,
+                dr[id]+0,
+                dw[id]+0,
+                du[id]+0,
+                pr[id]+0,
+                pw[id]+0,
+                pu[id]+0
+        }
+    }'
+else
+    echo "io.csv missing"
+fi
+
+echo
+echo "===== STORAGE / LOG ====="
+
+df -h /mnt/pve/nvme_vmstore 2>/dev/null |
+awk 'NR==2 {
+    printf "%-22s %s used / %s total (%s)\n",
+    "vm_store",$3,$2,$5
+}'
+
+LOGSIZE=$(du -sh "$ROOT/dmz-logs" 2>/dev/null |
+    awk '{print $1}')
+
+printf "%-22s %s / 10GiB\n" \
+    "monitor logs" "${LOGSIZE:-unknown}"
+
+echo
+echo "===== TIMERS ====="
+
+for U in \
+    dmz-cache-snapshot.timer \
+    dmz-health-snapshot.timer \
+    dmz-smart-snapshot.timer \
+    dmz-config-backup.timer \
+    dmz-log-cap.timer
+do
+    printf "%-32s %s\n" \
+        "$U" \
+        "$(systemctl is-active "$U" 2>/dev/null)"
+done
+
+echo
+echo "===== SMART ====="
+
+if [ -f "$SMART/smart.log" ]; then
+
+    MTIME=$(stat -c '%y' "$SMART/smart.log" 2>/dev/null |
+        cut -d. -f1)
+
+    printf "%-22s %s\n" "last snapshot" "$MTIME"
+
+    BAD=$(tail -4000 "$SMART/smart.log" |
+        grep -Ei \
+        'SMART overall-health.*FAILED|FAILING_NOW|Critical Warning:[[:space:]]*0x[1-9A-Fa-f]' |
+        tail -10)
+
+    if [ -n "$BAD" ]; then
+        echo "SMART WARNING:"
+        echo "$BAD"
+    else
+        echo "No SMART failure detected in latest log window."
+    fi
+else
+    echo "smart.log missing"
+fi
+
+echo
+echo "===== HOST STORAGE ERRORS THIS BOOT ====="
+
+ERR=$(journalctl -b -k --no-pager 2>/dev/null |
+    grep -Ei \
+    'I/O error|buffer I/O error|blk_update_request|medium error|EXT4-fs error|device-mapper.*error|nvme.*(timeout|reset|error)' |
+    tail -10)
+
+if [ -n "$ERR" ]; then
+    echo "$ERR"
+else
+    echo "No matching host storage errors."
+fi
+
+echo
+echo "============================================================"

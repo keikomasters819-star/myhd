@@ -1,0 +1,200 @@
+#!/bin/bash
+set -u
+
+BASE=/mnt/pve/nvme_vmstore/dmz-logs/v3-capture
+STATE=/run/dmz-v3-capture
+PARAM=/sys/module/dm_zoned/parameters
+IO=/mnt/pve/nvme_vmstore/dmz-logs/disk-io/io.csv
+VMID=100
+
+mkdir -p "$STATE" 2>/dev/null || true
+
+declare -A SERIAL META
+SERIAL[D01]=VFG3WPPD; META[D01]=4
+SERIAL[D02]=VFG2HGLC; META[D02]=5
+SERIAL[D03]=VEGVUTGZ; META[D03]=6
+SERIAL[D04]=VFG4D7BD; META[D04]=7
+SERIAL[D05]=VFG4ERMD; META[D05]=8
+SERIAL[D06]=VFG48PSD; META[D06]=9
+SERIAL[D07]=VFG3589D; META[D07]=10
+SERIAL[D08]=VFG2YAJC; META[D08]=11
+SERIAL[D09]=VFG4SNXD; META[D09]=12
+SERIAL[D10]=VFG50T9D; META[D10]=13
+SERIAL[D11]=VEGVPHMZ; META[D11]=16
+SERIAL[D12]=VEGVMATZ; META[D12]=17
+
+param(){ [ -r "$PARAM/$1" ] && cat "$PARAM/$1" || printf 'N/A'; }
+pair(){ dmsetup status "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="cache"){print $(i-1);exit}}'; }
+
+classify(){
+    local f="$1" t="$2" e="$3" c="$4" p="$5"
+    if [ "$t" -le 0 ]; then printf 'UNKNOWN';
+    elif [ $((f*100)) -le $((e*t)) ]; then printf 'EMERGENCY';
+    elif [ $((f*100)) -le $((c*t)) ]; then printf 'CRITICAL';
+    elif [ $((f*100)) -le $((p*t)) ]; then printf 'PRESSURE';
+    else printf 'RECOVERY'; fi
+}
+
+sample_io(){
+    [ -f "$IO" ] || { echo 'IO missing'; return; }
+    tail -1500 "$IO" | awk -F, '
+    $2=="dmz"{dr[$3]=$5;dw[$3]=$6;du[$3]=$9;ts=$1}
+    $2=="hc620"{pr[$3]=$5;pw[$3]=$6;pu[$3]=$9;ts=$1}
+    $2=="nvme"{nr=$5;nw=$6;nu=$9;nri=$7;nwi=$8;ts=$1}
+    $2=="md"{mr[$3]=$5;mw[$3]=$6;mu[$3]=$9;mri[$3]=$7;mwi[$3]=$8;ts=$1}
+    END{
+      print "IO_TS " ts
+      for(i=1;i<=12;i++){id=sprintf("D%02d",i);printf "IO %s dmzR=%.2fM dmzW=%.2fM dmzU=%.2f diskR=%.2fM diskW=%.2fM diskU=%.2f\n",id,dr[id]+0,dw[id]+0,du[id]+0,pr[id]+0,pw[id]+0,pu[id]+0}
+      printf "IO_NVME read=%.2fM write=%.2fM rIOPS=%.2f wIOPS=%.2f util=%.2f\n",nr+0,nw+0,nri+0,nwi+0,nu+0
+      for(k=1;k<=3;k++){if(k==1)d="cacheA";else if(k==2)d="cacheB";else d="vmstore";printf "IO_MD %s read=%.2fM write=%.2fM rIOPS=%.2f wIOPS=%.2f util=%.2f\n",d,mr[d]+0,mw[d]+0,mri[d]+0,mwi[d]+0,mu[d]+0}
+    }'
+}
+
+sample(){
+    local now vm qpid qstat ra rm e c p totalf totalt active_list id i m pr f t cls
+    now=$(date '+%F %T')
+    vm=$(timeout 3 qm status "$VMID" 2>/dev/null | awk '{print $2}')
+    qpid='-'; qstat='-'
+    if [ "$vm" = running ] && [ -r "/run/qemu-server/${VMID}.pid" ]; then
+        qpid=$(cat "/run/qemu-server/${VMID}.pid" 2>/dev/null || echo '-')
+        [ "$qpid" = '-' ] || qstat=$(ps -p "$qpid" -o stat= 2>/dev/null | xargs || echo '-')
+    fi
+    ra=$(param reclaim_active); rm=$(param reclaim_max_active)
+    e=$(param reclaim_emergency_pct); c=$(param reclaim_critical_pct); p=$(param reclaim_pressure_pct)
+    case "$e" in ''|*[!0-9]*) e=5;; esac
+    case "$c" in ''|*[!0-9]*) c=20;; esac
+    case "$p" in ''|*[!0-9]*) p=50;; esac
+
+    echo '############################################################'
+    echo "TIME $now"
+    echo "VM status=${vm:-unknown} qpid=$qpid qstat=$qstat"
+    echo "LOAD $(cut -d' ' -f1-3 /proc/loadavg)"
+    echo "SCHED active=$ra max=$rm start=$(param reclaim_start) stop=$(param reclaim_stop) retry=$(param reclaim_slot_retry_ms) yield=$(param reclaim_yield_ms) emergency=$e critical=$c pressure=$p"
+
+    totalf=0; totalt=0
+    for i in $(seq -w 1 12); do
+        id="D$i"; m="dmz_${id}_${SERIAL[$id]}"; pr=$(pair "$m")
+        if [[ "$pr" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+            f=${BASH_REMATCH[1]}; t=${BASH_REMATCH[2]}; totalf=$((totalf+f)); totalt=$((totalt+t)); cls=$(classify "$f" "$t" "$e" "$c" "$p")
+            printf 'CACHE %s serial=%s free=%s/%s pct=%.1f class=%s\n' "$id" "${SERIAL[$id]}" "$f" "$t" "$(awk -v f="$f" -v t="$t" 'BEGIN{print 100*f/t}')" "$cls"
+        else
+            echo "CACHE $id serial=${SERIAL[$id]} ERROR"
+        fi
+    done
+    echo "CACHE_TOTAL free=$totalf/$totalt"
+
+    active_list=$(ps -eLo pid=,stat=,wchan:40=,args= 2>/dev/null |
+        awk '$2 ~ /^D/ && $3=="dmz_reclaim_copy" &&
+             /dmz_rwq_dmz-dm-[0-9]+_/ {print}')
+    if [ -n "$active_list" ]; then
+        while IFS= read -r line; do
+            n=$(printf '%s\n' "$line" | sed -n 's/.*dmz_rwq_dmz-dm-\([0-9][0-9]*\)_.*/\1/p')
+            id='UNKNOWN'
+            case "$n" in 4)id=D01;;5)id=D02;;6)id=D03;;7)id=D04;;8)id=D05;;9)id=D06;;10)id=D07;;11)id=D08;;12)id=D09;;13)id=D10;;16)id=D11;;17)id=D12;;esac
+            echo "ACTIVE $id meta=dmz-dm-$n $line"
+        done <<< "$active_list"
+    else
+        echo 'ACTIVE none'
+    fi
+
+    rd=$(ps -eLo stat=,wchan:64= 2>/dev/null | awk '$1~/^D/&&$2=="dmz_reclaim_copy"{n++}END{print n+0}')
+    cd=$(ps -eLo stat=,wchan:64= 2>/dev/null | awk '$1~/^D/&&$2=="dmz_get_chunk_mapping"{n++}END{print n+0}')
+    kd=$(ps -eLo stat=,wchan:64=,args= 2>/dev/null | awk '$1~/^D/&&index($0,"kcopyd"){n++}END{print n+0}')
+    td=$(ps -eLo stat= 2>/dev/null | awk '$1~/^D/{n++}END{print n+0}')
+    echo "DSTATE reclaimD=$rd chunkD=$cd kcopyD=$kd totalD=$td"
+    sample_io
+    echo
+}
+
+finish_log(){
+    local log="$1" start_epoch="$2"
+    {
+        echo '============================================================'
+        echo "CAPTURE END $(date '+%F %T')"
+        echo '============================================================'
+        echo '===== FINAL DMZ STATUS ====='
+        /usr/local/sbin/dmz-status 2>&1 || true
+        echo '===== KERNEL STORAGE/HANG EVENTS DURING CAPTURE ====='
+        journalctl -b -k --since "@$start_epoch" --no-pager 2>/dev/null |
+            grep -Ei 'hung task|blocked for more than|I/O error|buffer I/O error|blk_update_request|medium error|EXT4-fs error|device-mapper.*error|nvme.*(timeout|reset|error)|ata[0-9]+.*(reset|error|failed)' || true
+        echo '===== END ====='
+    } >> "$log"
+}
+
+daemon(){
+    local log="$1" duration="$2" interval="$3" start_epoch start_s n
+    start_epoch=$(date +%s); start_s=$SECONDS; n=0
+    trap 'finish_log "$log" "$start_epoch"; rm -f "$STATE/pid"; exit 0' TERM INT
+    {
+        echo '============================================================'
+        echo ' DM-ZONED V3 ONLINE CAPTURE'
+        echo " START $(date '+%F %T %Z %z')"
+        echo " HOST $(hostname)  KERNEL $(uname -r)"
+        echo " LIVE_SRC $(cat /sys/module/dm_zoned/srcversion 2>/dev/null || echo not-loaded)"
+        echo " DURATION $duration  INTERVAL $interval"
+        echo '============================================================'
+        echo '===== INITIAL PARAMETERS ====='
+        for x in reclaim_active reclaim_max_active reclaim_start reclaim_stop reclaim_idle_sec reclaim_idle_throttle reclaim_poll_sec reclaim_slot_retry_ms reclaim_yield_ms reclaim_emergency_pct reclaim_critical_pct reclaim_pressure_pct reclaim_curve; do echo "$x=$(param "$x")"; done
+        echo '===== VM100 CONFIG KEY LINES ====='
+        qm config "$VMID" 2>/dev/null | grep -E '^(cpu:|cores:|sockets:|numa:|memory:|onboot:|boot:|sata0:|sata1:|args:)' || true
+        echo
+    } >> "$log"
+    while :; do
+        sample >> "$log" 2>&1
+        n=$((n+1))
+        if [ $((n%6)) -eq 0 ]; then
+            journalctl -b -k --since '35 seconds ago' --no-pager 2>/dev/null |
+                grep -Ei 'hung task|blocked for more than|I/O error|buffer I/O error|blk_update_request|medium error|EXT4-fs error|device-mapper.*error|nvme.*(timeout|reset|error)|ata[0-9]+.*(reset|error|failed)' |
+                sed 's/^/KERNEL_RECENT /' >> "$log" || true
+        fi
+        if [ "$duration" -gt 0 ] && [ $((SECONDS-start_s)) -ge "$duration" ]; then break; fi
+        sleep "$interval"
+    done
+    finish_log "$log" "$start_epoch"
+    rm -f "$STATE/pid"
+}
+
+cmd=${1:-status}
+case "$cmd" in
+    start)
+        duration=${2:-7200}; interval=${3:-5}
+        mkdir -p "$BASE" "$STATE"
+        if [ -r "$STATE/pid" ]; then
+            old=$(cat "$STATE/pid" 2>/dev/null || true)
+            if [ -n "$old" ] && kill -0 "$old" 2>/dev/null; then echo "already running pid=$old"; exit 1; fi
+        fi
+        ts=$(date +%Y%m%d-%H%M%S); log="$BASE/dmz-v3-online-$ts.log"
+        printf '%s\n' "$log" > "$STATE/current"
+        nohup "$0" daemon "$log" "$duration" "$interval" >/dev/null 2>&1 &
+        pid=$!; printf '%s\n' "$pid" > "$STATE/pid"
+        echo "STARTED pid=$pid"
+        echo "LOG=$log"
+        echo "duration=${duration}s interval=${interval}s"
+        ;;
+    daemon)
+        daemon "$2" "$3" "$4"
+        ;;
+    status)
+        log=$(cat "$STATE/current" 2>/dev/null || true); pid=$(cat "$STATE/pid" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo "STATUS=RUNNING PID=$pid"; else echo 'STATUS=STOPPED'; fi
+        echo "LOG=${log:-none}"
+        [ -n "$log" ] && [ -f "$log" ] && { ls -lh "$log"; tail -5 "$log"; }
+        ;;
+    path)
+        cat "$STATE/current" 2>/dev/null || true
+        ;;
+    tail)
+        log=$(cat "$STATE/current" 2>/dev/null || true); [ -n "$log" ] && tail -f "$log"
+        ;;
+    stop)
+        pid=$(cat "$STATE/pid" 2>/dev/null || true); log=$(cat "$STATE/current" 2>/dev/null || true)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then kill -TERM "$pid"; for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done; fi
+        echo "STOPPED"
+        echo "LOG=${log:-none}"
+        [ -n "$log" ] && [ -f "$log" ] && sha256sum "$log"
+        ;;
+    *)
+        echo "Usage: $0 start [duration_sec] [interval_sec] | status | path | tail | stop"
+        exit 2
+        ;;
+esac

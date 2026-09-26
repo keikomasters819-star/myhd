@@ -1,0 +1,630 @@
+#!/bin/bash
+
+set -u
+
+#
+# dm-zoned adaptive reclaim watchdog
+# Pure shell version
+#
+
+VMID="${VMID:-100}"
+
+CHECK_SEC="${CHECK_SEC:-5}"
+KICK_SEC="${KICK_SEC:-10}"
+
+#
+# busy状态：
+# <=40%开始持续kick
+# 但当前dm-zoned真正busy reclaim仍受内核原始约30%阈值限制
+#
+BUSY_KICK_PCT="${BUSY_KICK_PCT:-40}"
+
+#
+# 低负载：
+# 最近30秒，10个dm-zoned顶层合计前台IO <= 1MiB/s
+#
+LIGHT_WINDOW="${LIGHT_WINDOW:-30}"
+LIGHT_BPS="${LIGHT_BPS:-1048576}"
+LIGHT_TARGET="${LIGHT_TARGET:-80}"
+
+#
+# 深度低负载：
+# 最近300秒平均 <= 256KiB/s
+#
+DEEP_WINDOW="${DEEP_WINDOW:-300}"
+DEEP_BPS="${DEEP_BPS:-262144}"
+DEEP_TARGET="${DEEP_TARGET:-90}"
+
+#
+# VM停止后的维护目标
+#
+STOPPED_TARGET="${STOPPED_TARGET:-95}"
+
+#
+# dm-zoned内核idle判断原本约10秒。
+# Shell使用12秒，留一点余量。
+#
+KERNEL_IDLE_SEC="${KERNEL_IDLE_SEC:-12}"
+
+#
+# 到目标以后连续一段时间发送4K read，
+# 防止已经启动的idle reclaim明显冲过目标。
+#
+STOP_HOLD_SEC="${STOP_HOLD_SEC:-20}"
+
+LOG_INTERVAL="${LOG_INTERVAL:-30}"
+
+HIST="/run/dmz-reclaim-frontend.history"
+
+
+exec 9>/run/dmz-reclaim-watchdog.lock
+
+if ! flock -n 9; then
+    echo "ERROR: watchdog already running"
+    exit 1
+fi
+
+
+declare -A PREV_SECTORS
+declare -A LAST_IO
+declare -A LAST_KICK
+declare -A STOP_UNTIL
+declare -A TARGET_MARK
+
+
+get_maps()
+{
+    dmsetup ls --target zoned 2>/dev/null |
+    awk '{print $1}' |
+    grep '^dmz_' |
+    sort
+}
+
+
+get_pair()
+{
+    dmsetup status "$1" 2>/dev/null |
+    awk '
+    {
+        for(i=1;i<=NF;i++) {
+            if($i=="random") {
+                print $(i-1)
+                exit
+            }
+        }
+    }'
+}
+
+
+get_mm()
+{
+    dmsetup info -c \
+        --noheadings \
+        -o major,minor \
+        "$1" 2>/dev/null |
+    tr -d ' '
+}
+
+
+#
+# Linux block stat里的sector计数按512字节单位统计。
+# 第3列：sectors read
+# 第7列：sectors written
+#
+mapper_sectors()
+{
+    local m="$1"
+    local mm
+
+    mm="$(get_mm "$m")"
+
+    if [ -z "$mm" ] ||
+       [ ! -r "/sys/dev/block/$mm/stat" ]; then
+        echo 0
+        return
+    fi
+
+    awk '{printf "%.0f\n", $3 + $7}' \
+        "/sys/dev/block/$mm/stat"
+}
+
+
+kick()
+{
+    dmsetup message "$1" 0 reclaim \
+        >/dev/null 2>&1 || true
+}
+
+
+pulse()
+{
+    local m="$1"
+
+    timeout 5 \
+        dd \
+        if="/dev/mapper/$m" \
+        of=/dev/null \
+        bs=4096 \
+        count=1 \
+        iflag=direct \
+        status=none \
+        2>/dev/null || true
+
+    #
+    # 吸收watchdog自己产生的4K BIO，
+    # 下一轮不要把它误认为DSM业务IO。
+    #
+    PREV_SECTORS["$m"]="$(mapper_sectors "$m")"
+}
+
+
+vm_state()
+{
+    qm status "$VMID" 2>/dev/null |
+    awk '{print $2}'
+}
+
+
+#
+# 从历史文件计算指定窗口的平均B/s
+#
+avg_bps()
+{
+    local window="$1"
+    local now="$2"
+    local current="$3"
+
+    local target
+    local sample
+    local ts
+    local old
+    local dt
+    local delta
+
+    target=$((now - window))
+
+    sample="$(
+        awk -v t="$target" '
+        $1 <= t {
+            ts=$1
+            val=$2
+        }
+        END {
+            if(ts != "")
+                print ts, val
+        }' "$HIST" 2>/dev/null
+    )"
+
+    if [ -z "$sample" ]; then
+        echo -1
+        return
+    fi
+
+    read -r ts old <<<"$sample"
+
+    dt=$((now - ts))
+
+    if [ "$dt" -le 0 ]; then
+        echo -1
+        return
+    fi
+
+    delta=$((current - old))
+
+    if [ "$delta" -lt 0 ]; then
+        echo -1
+        return
+    fi
+
+    echo $((delta * 512 / dt))
+}
+
+
+human_rate()
+{
+    local b="$1"
+
+    if [ "$b" -lt 0 ]; then
+        echo "warming"
+    elif [ "$b" -ge 1048576 ]; then
+        awk -v b="$b" 'BEGIN {
+            printf "%.2fMiB/s", b/1048576
+        }'
+    elif [ "$b" -ge 1024 ]; then
+        awk -v b="$b" 'BEGIN {
+            printf "%.1fKiB/s", b/1024
+        }'
+    else
+        echo "${b}B/s"
+    fi
+}
+
+
+echo "======================================================"
+echo "dm-zoned adaptive reclaim watchdog"
+echo "======================================================"
+echo "VMID                 = $VMID"
+echo "check                = ${CHECK_SEC}s"
+echo "busy kick            = <=${BUSY_KICK_PCT}%"
+echo "light window         = ${LIGHT_WINDOW}s"
+echo "light threshold      = ${LIGHT_BPS} B/s"
+echo "light target         = ${LIGHT_TARGET}%"
+echo "deep window          = ${DEEP_WINDOW}s"
+echo "deep threshold       = ${DEEP_BPS} B/s"
+echo "deep target          = ${DEEP_TARGET}%"
+echo "kernel idle gap      = ${KERNEL_IDLE_SEC}s"
+echo "VM stopped target    = ${STOPPED_TARGET}%"
+echo "======================================================"
+
+
+NOW="$(date +%s)"
+
+mapfile -t MAPS < <(get_maps)
+
+if [ "${#MAPS[@]}" -eq 0 ]; then
+    echo "ERROR: no dm-zoned targets"
+    exit 1
+fi
+
+
+#
+# 初始化每个mapper
+#
+AGG=0
+
+for m in "${MAPS[@]}"; do
+
+    s="$(mapper_sectors "$m")"
+
+    PREV_SECTORS["$m"]="$s"
+    LAST_IO["$m"]="$NOW"
+    LAST_KICK["$m"]=0
+
+    AGG=$((AGG + s))
+
+done
+
+
+echo "$NOW $AGG" >"$HIST"
+
+LAST_AGG="$AGG"
+LAST_LOG=0
+LAST_MODE="INIT"
+
+
+while true; do
+
+    sleep "$CHECK_SEC"
+
+    NOW="$(date +%s)"
+
+    mapfile -t MAPS < <(get_maps)
+
+    if [ "${#MAPS[@]}" -eq 0 ]; then
+        echo "[$(date '+%F %T')] no dm-zoned targets"
+        continue
+    fi
+
+
+    #
+    # ================================
+    # 采样每个mapper的前台block stat
+    # ================================
+    #
+
+    AGG=0
+
+    for m in "${MAPS[@]}"; do
+
+        cur="$(mapper_sectors "$m")"
+
+        old="${PREV_SECTORS[$m]:-$cur}"
+
+        #
+        # 顶层dm device发生读写：
+        # 认为DSM/QEMU有前台BIO。
+        #
+        if [ "$cur" -ne "$old" ]; then
+            LAST_IO["$m"]="$NOW"
+        fi
+
+        PREV_SECTORS["$m"]="$cur"
+
+        AGG=$((AGG + cur))
+
+    done
+
+
+    #
+    # mapper reload/reset导致计数回退时重建历史。
+    #
+    if [ "$AGG" -lt "$LAST_AGG" ]; then
+        echo "$NOW $AGG" >"$HIST"
+    else
+        echo "$NOW $AGG" >>"$HIST"
+    fi
+
+    LAST_AGG="$AGG"
+
+
+    #
+    # 只保留足够计算300秒平均值的历史
+    #
+    KEEP_FROM=$((NOW - DEEP_WINDOW - 120))
+
+    awk -v t="$KEEP_FROM" '
+        $1 >= t
+    ' "$HIST" >"${HIST}.tmp"
+
+    mv "${HIST}.tmp" "$HIST"
+
+
+    RATE30="$(avg_bps "$LIGHT_WINDOW" "$NOW" "$AGG")"
+    RATE300="$(avg_bps "$DEEP_WINDOW" "$NOW" "$AGG")"
+
+    VMSTATE="$(vm_state)"
+
+
+    #
+    # ================================
+    # 状态判定
+    # ================================
+    #
+
+    if [ "$VMSTATE" = "stopped" ]; then
+
+        MODE="MAINT"
+        TARGET="$STOPPED_TARGET"
+
+    elif [ "$RATE30" -ge 0 ] &&
+         [ "$RATE300" -ge 0 ] &&
+         [ "$RATE30" -le "$LIGHT_BPS" ] &&
+         [ "$RATE300" -le "$DEEP_BPS" ]; then
+
+        MODE="DEEP-IDLE"
+        TARGET="$DEEP_TARGET"
+
+    elif [ "$RATE30" -ge 0 ] &&
+         [ "$RATE30" -le "$LIGHT_BPS" ]; then
+
+        MODE="LIGHT-IDLE"
+        TARGET="$LIGHT_TARGET"
+
+    else
+
+        MODE="BUSY"
+        TARGET="$BUSY_KICK_PCT"
+
+    fi
+
+
+    #
+    # 从idle整理状态恢复成BUSY时，
+    # 给各target一个前台BIO，促使idle reclaim退出。
+    #
+    if [ "$MODE" = "BUSY" ] &&
+       [ "$LAST_MODE" != "BUSY" ] &&
+       [ "$LAST_MODE" != "INIT" ]; then
+
+        echo
+        echo "[$(date '+%F %T')] workload resumed -> stop idle reclaim"
+
+        for m in "${MAPS[@]}"; do
+            pulse "$m"
+        done
+
+    fi
+
+    LAST_MODE="$MODE"
+
+
+    #
+    # ================================
+    # 每盘策略
+    # ================================
+    #
+
+    for m in "${MAPS[@]}"; do
+
+        pair="$(get_pair "$m")"
+
+        if [[ ! "$pair" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+            continue
+        fi
+
+        FREE="${BASH_REMATCH[1]}"
+        TOTAL="${BASH_REMATCH[2]}"
+
+        PCT=$((FREE * 100 / TOTAL))
+
+        QUIET=$((NOW - ${LAST_IO[$m]:-$NOW}))
+
+        lastkick="${LAST_KICK[$m]:-0}"
+
+
+        #
+        # ----------------
+        # BUSY模式
+        # ----------------
+        #
+        if [ "$MODE" = "BUSY" ]; then
+
+            #
+            # 低于40%持续尝试唤醒。
+            #
+            # 当前原生内核：
+            # 31~40% busy通常仍会拒绝真正reclaim；
+            # <=30%才会进入busy reclaim。
+            #
+            if [ "$PCT" -le "$BUSY_KICK_PCT" ]; then
+
+                if [ $((NOW - lastkick)) -ge "$KICK_SEC" ]; then
+                    kick "$m"
+                    LAST_KICK["$m"]="$NOW"
+                fi
+
+            fi
+
+            continue
+        fi
+
+
+        #
+        # ----------------
+        # LIGHT / DEEP / MAINT
+        # ----------------
+        #
+
+        
+TARGET_ZONES=$(( (TOTAL * TARGET + 99) / 100 ))
+
+
+
+        if [ "$FREE" -lt "$TARGET_ZONES" ]; then
+
+            TARGET_MARK["$m"]=0
+            STOP_UNTIL["$m"]=0
+
+            #
+            # 低负载只是“允许整理”。
+            #
+            # 真正kick之前要求这个mapper自己已经
+            # 连续12秒没有前台BIO，
+            # 从而满足当前内核idle reclaim条件。
+            #
+            if [ "$QUIET" -ge "$KERNEL_IDLE_SEC" ]; then
+
+                if [ $((NOW - lastkick)) -ge "$KICK_SEC" ]; then
+
+                    kick "$m"
+
+                    LAST_KICK["$m"]="$NOW"
+
+                fi
+
+            fi
+
+
+        else
+
+            #
+            # 到达80/90/95目标
+            #
+            if [ "${TARGET_MARK[$m]:-0}" != "$TARGET" ]; then
+
+                TARGET_MARK["$m"]="$TARGET"
+
+                STOP_UNTIL["$m"]=$(
+                    (
+                        NOW + STOP_HOLD_SEC
+                    )
+                )
+
+                echo \
+                "[$(date '+%F %T')] $m reached ${TARGET}% : $pair"
+
+            fi
+
+
+            #
+            # 已经启动的victim migration不能瞬间停。
+            # 连续20秒给一个4K只读BIO，帮助worker退出idle状态。
+            #
+            if [ "$NOW" -lt "${STOP_UNTIL[$m]:-0}" ]; then
+                pulse "$m"
+            fi
+
+        fi
+
+    done
+
+
+    #
+    # ================================
+    # 日志
+    # ================================
+    #
+
+    if [ $((NOW - LAST_LOG)) -ge "$LOG_INTERVAL" ]; then
+
+        echo
+        echo "======================================================"
+        echo "$(date '+%F %T')"
+        echo "VM=$VMSTATE"
+        echo "MODE=$MODE"
+        echo "TARGET=${TARGET}%"
+        echo "30s=$(human_rate "$RATE30")"
+        echo "300s=$(human_rate "$RATE300")"
+        echo "======================================================"
+
+        printf \
+        "%-28s %-11s %-6s %-8s %-16s\n" \
+        "MAPPER" \
+        "RANDOM" \
+        "FREE" \
+        "QUIET" \
+        "ACTION"
+
+
+        for m in "${MAPS[@]}"; do
+
+            pair="$(get_pair "$m")"
+
+            if [[ ! "$pair" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+                continue
+            fi
+
+            FREE="${BASH_REMATCH[1]}"
+            TOTAL="${BASH_REMATCH[2]}"
+
+            PCT=$((FREE * 100 / TOTAL))
+
+            QUIET=$((NOW - ${LAST_IO[$m]:-$NOW}))
+
+
+            if [ "$MODE" = "BUSY" ]; then
+
+                if [ "$PCT" -le "$BUSY_KICK_PCT" ]; then
+                    ACTION="KICK-BUSY"
+                else
+                    ACTION="BUSINESS"
+                fi
+
+            else
+
+                
+TARGET_ZONES=$(( (TOTAL * TARGET + 99) / 100 ))
+
+
+                if [ "$FREE" -ge "$TARGET_ZONES" ]; then
+
+                    ACTION="HOLD"
+
+                elif [ "$QUIET" -ge "$KERNEL_IDLE_SEC" ]; then
+
+                    ACTION="RECLAIM"
+
+                else
+
+                    ACTION="WAIT-GAP"
+
+                fi
+
+            fi
+
+
+            printf \
+            "%-28s %-11s %3d%%   %4ss    %-16s\n" \
+            "$m" \
+            "$pair" \
+            "$PCT" \
+            "$QUIET" \
+            "$ACTION"
+
+        done
+
+        LAST_LOG="$NOW"
+
+    fi
+
+done
